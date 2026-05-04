@@ -1,0 +1,8 @@
+*.bak
+*.tmp
+*.log
+.DS_Store
+inbox/
+outbox/
+archive/
+.enabled
