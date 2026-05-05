@@ -97,10 +97,11 @@ if [ ! -f "$BRIDGE_DIR/.enabled" ]; then
   exit 0
 fi
 
-INBOX="$BRIDGE_DIR/inbox"
+INBOX_TOP="$BRIDGE_DIR/inbox"
+INBOX_SESSION="$BRIDGE_DIR/sessions/$SESSION_ID/inbox"
 OUTBOX="$BRIDGE_DIR/outbox"
 ARCHIVE="$BRIDGE_DIR/archive"
-mkdir -p "$INBOX" "$OUTBOX" "$ARCHIVE"
+mkdir -p "$INBOX_TOP" "$INBOX_SESSION" "$OUTBOX" "$ARCHIVE"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_FILE="$OUTBOX/${SESSION_ID}-${TS}.md"
@@ -144,8 +145,9 @@ TMP="$OUT_FILE.tmp"
   printf '%s\n\n' '---'
   printf '%s\n\n' "$LAST_ASSISTANT"
   printf '%s\n' '---'
-  printf '\n%s\n' "Reply by creating any \`.md\` or \`.txt\` file in:"
-  printf '%s\n' "\`$INBOX\`"
+  printf '\n%s\n' "Reply by creating any \`.md\` or \`.txt\` file in either:"
+  printf '%s\n' "- \`$INBOX_SESSION\` (this session only)"
+  printf '%s\n' "- \`$INBOX_TOP\` (any session — single-session mode)"
 } >"$TMP"
 mv "$TMP" "$OUT_FILE"
 log "session=$SESSION_ID wrote $OUT_FILE"
@@ -155,11 +157,17 @@ log "session=$SESSION_ID wrote $OUT_FILE"
 START_EPOCH="$(date +%s)"
 TIMEOUT="${CLAUDE_BRIDGE_TIMEOUT:-1800}"
 POLL="${CLAUDE_BRIDGE_POLL:-2}"
-log "session=$SESSION_ID polling $INBOX timeout=${TIMEOUT}s"
+log "session=$SESSION_ID polling session=$INBOX_SESSION top=$INBOX_TOP timeout=${TIMEOUT}s"
 
 REPLY_FILE=""
 while :; do
-  CAND="$(ls -1t "$INBOX"/*.md "$INBOX"/*.txt 2>/dev/null | head -n1 || true)"
+  # Per-session subfolder wins unconditionally — that is the whole point of
+  # routing by session id. Top-level inbox is the fallback for single-session
+  # / unrouted use.
+  CAND="$(ls -1t "$INBOX_SESSION"/*.md "$INBOX_SESSION"/*.txt 2>/dev/null | head -n1 || true)"
+  if [ -z "$CAND" ] || [ ! -f "$CAND" ]; then
+    CAND="$(ls -1t "$INBOX_TOP"/*.md "$INBOX_TOP"/*.txt 2>/dev/null | head -n1 || true)"
+  fi
   if [ -n "$CAND" ] && [ -f "$CAND" ]; then
     REPLY_FILE="$CAND"
     break

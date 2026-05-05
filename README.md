@@ -221,12 +221,53 @@ none of that — that's the whole point. (A Power Automate companion that
   `~/OneDrive*`, `~/Dropbox`, `~/Google Drive`. PRs welcome for more.
 - Requires `bash`, `jq`, `date`, `ls`. That's it.
 
+## v1.1: per-session inboxes + `/new` and `/task` routing
+
+Two extras land together:
+
+**Per-session inbox subfolders.** The Stop hook now polls
+`$BRIDGE/sessions/<session_id>/inbox/` first, then falls back to the shared
+top-level `inbox/`. Multiple concurrent `claude` sessions no longer fight
+over the same drop folder — each phone reply only resumes the session it was
+addressed to. Single-session users see no behavior change.
+
+**Phone-initiated sessions via `bin/bridge-router.sh`.** A small long-running
+companion that watches the top-level `inbox/` for files starting with a
+directive on the first line:
+
+| First line       | Effect                                                        |
+| ---------------- | ------------------------------------------------------------- |
+| `/new <title>`   | Spawns `claude -p "<rest of file>" --output-format json` and records `tasks/<title> → session_id`. Result lands in `outbox/`. |
+| `/task <title>`  | Resumes the recorded session via `claude -p "..." --resume <session_id>` and writes the new turn to `outbox/`. |
+| (no directive)   | Left alone — the regular Stop hook on a live interactive session will pick it up. |
+
+So from your phone you can now both **start** brand-new sessions and route
+follow-ups to a specific task, all by writing one file in OneDrive:
+
+```
+/new triage-flaky-test
+The CI job api/integration is flaky on main. Look at the last 5 runs and
+tell me whether to retry, quarantine, or revert.
+```
+
+…and the response shows up in `outbox/<session_id>-<ts>.md`.
+
+Run the router with `nohup bin/bridge-router.sh &` (or wire it into launchd).
+It honors the same `.enabled` kill-switch and `CLAUDE_BRIDGE_*` env vars as
+the hook, plus:
+
+| Variable                  | Default                              | Meaning                                       |
+| ------------------------- | ------------------------------------ | --------------------------------------------- |
+| `CLAUDE_BRIDGE_WORKDIR`   | `$HOME`                              | cwd for spawned `claude -p` calls             |
+| `CLAUDE_BRIDGE_CLAUDE`    | `claude`                             | Path to the Claude CLI binary                 |
+| `CLAUDE_BRIDGE_FLAGS`     | `--dangerously-skip-permissions`     | Extra flags appended to every `claude -p` call|
+
+Tests live under `tests/`: `bash tests/test-hook-per-session.sh` and
+`bash tests/test-router.sh` (the router test stubs `claude` with a fake
+binary on PATH so no real API calls are made).
+
 ## Roadmap
 
-- **v1.1** — per-session inbox subfolders so multiple concurrent Claude
-  sessions don't share an inbox.
-- **v1.1** — wrapper around `claude -p --resume` so a single inbox can
-  *start* new sessions on `/new <title>` and route messages by `task_id`.
 - **v1.2** — opt-in [Power Automate](https://make.powerautomate.com/) flow
   templates: `[Claude]` emails → inbox files; outbox files → email / Teams
   self-chat. Pure UX sugar; the core stays folder-based.
