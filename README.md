@@ -370,6 +370,21 @@ Configuration:
 | `CLAUDE_BRIDGE_PERMISSION_TIMEOUT`| `1800`  | Seconds to wait before auto-blocking.         |
 | `CLAUDE_BRIDGE_PERMISSION_DEFAULT`| `block` | `block` (recommended) or `passthrough`.       |
 
+> ⚠️ **Router-spawned `/new` and `/task` sessions skip this gate by default.**
+> The router invokes `claude -p` with `--dangerously-skip-permissions`
+> (`CLAUDE_BRIDGE_FLAGS` default), which short-circuits Claude Code's whole
+> permission system *including* the `PreToolUse` hook. If you want phone-side
+> approval to apply to phone-spawned sessions too, override the flag:
+>
+> ```sh
+> export CLAUDE_BRIDGE_FLAGS=""
+> ```
+>
+> …and the router's `claude -p` calls will go through `PreToolUse` like any
+> interactive session. Tradeoff: the router will then block on every gated
+> tool call until *you* reply — fine for human-in-the-loop, miserable for
+> overnight automation.
+
 ### `outbox/INDEX.md` — the phone's home screen
 
 Every hook now rewrites `outbox/INDEX.md` atomically when a session changes

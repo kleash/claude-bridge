@@ -55,6 +55,15 @@ else
   warn "bash version unknown" "claude-bridge expects bash; behavior on other shells is untested."
 fi
 
+# Some sandboxed environments (corporate CI runners, locked-down containers)
+# export BASH_ENV pointing at an init script that can fail under `set -u`. All
+# claude-bridge hooks use `set -u`, so a broken BASH_ENV will silently abort
+# every hook before it can write to outbox. Surface this so it's diagnosable.
+if [ -n "${BASH_ENV:-}" ]; then
+  warn "BASH_ENV is set: $BASH_ENV" \
+       "If hooks silently exit with no outbox file, the BASH_ENV script may be aborting under set -u. Try unsetting it before launching claude."
+fi
+
 # 2. Hook installation
 section "Hook installation ($DEST_DIR)"
 

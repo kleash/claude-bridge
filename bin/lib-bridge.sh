@@ -89,6 +89,62 @@ lb_task_for_sid() {
 # ---- INDEX.md --------------------------------------------------------------
 # Rebuild outbox/INDEX.md atomically. Source of truth is sessions/<sid>/status.
 
+# Print one markdown table row per session, sorted by status mtime desc, plus
+# a placeholder row if no sessions exist. Shared by lb_index_rebuild and the
+# router's /list / /status all-tasks output.
+#
+# Portability: BSD find on macOS lacks `-printf '%T@ %p\n'`, so we enumerate
+# matching files first and pair each with its mtime via stat (BSD `-f %m`
+# falls back to GNU `-c %Y`). Verified on macOS Sonoma + Ubuntu 22.
+lb_render_task_rows() {
+  local bridge_dir="$1" sdir sid status note since task count=0
+  if [ -d "$bridge_dir/sessions" ]; then
+    while IFS= read -r sdir; do
+      [ -n "$sdir" ] || continue
+      sid="$(basename "$(dirname "$sdir")")"
+      status="$(cat "$sdir" 2>/dev/null || echo idle)"
+      note="$(cat "$(dirname "$sdir")/note" 2>/dev/null || true)"
+      since="$(date -u -r "$sdir" +%FT%TZ 2>/dev/null \
+               || date -u -d "@$(stat -c %Y "$sdir" 2>/dev/null)" +%FT%TZ 2>/dev/null \
+               || true)"
+      task="$(lb_task_for_sid "$bridge_dir" "$sid")"
+      note="${note//|/\\|}"; note="${note//$'\n'/ }"
+      printf '| %s | %s | `%s` | %s | %s |\n' \
+        "$status" "${task:--}" "$sid" "${since:--}" "${note:--}"
+      count=$((count+1))
+    done < <(lb_status_files_recent "$bridge_dir")
+  fi
+  if [ "$count" -eq 0 ]; then
+    printf '| _no tasks yet_ | — | — | — | — |\n'
+  fi
+}
+
+# Emit each sessions/<sid>/status file path, newest mtime first.
+# Portable replacement for `find … -printf '%T@ %p\n' | sort -rn`.
+#
+# Picking the mtime tool is fiddly:
+#   - `stat -c %Y FILE`  → GNU only.
+#   - `stat -f %m FILE`  → BSD-only intent, but GNU stat accepts `-f` as
+#     "filesystem status" mode and emits a multi-line block, which then
+#     poisons our pipeline (sort sees garbage paths). Avoided.
+#   - `date -u -r FILE +%s` → epoch seconds on BSD AND GNU coreutils ≥ 8.21
+#     (released 2013). Single-line output. This is what we use.
+lb_status_files_recent() {
+  local bridge_dir="$1" f m
+  [ -d "$bridge_dir/sessions" ] || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    m="$(date -u -r "$f" +%s 2>/dev/null \
+         || stat -c %Y "$f" 2>/dev/null \
+         || echo 0)"
+    # Belt-and-braces: ensure m is a single integer, not multi-line garbage.
+    m="$(printf '%s' "$m" | head -n1 | tr -dc '0-9')"
+    printf '%s %s\n' "${m:-0}" "$f"
+  done < <(find "$bridge_dir/sessions" -mindepth 2 -maxdepth 2 -name status -type f 2>/dev/null) \
+    | sort -rn \
+    | awk '{ $1=""; sub(/^ /,""); print }'
+}
+
 lb_index_rebuild() {
   local bridge_dir="$1"
   [ -n "$bridge_dir" ] || return 0
@@ -101,31 +157,7 @@ lb_index_rebuild() {
     printf 'Drop a reply file in `inbox/` (or `sessions/<sid>/inbox/`) to resume a waiting session.\n\n'
     printf '| Status | Task | Session | Last update | Note |\n'
     printf '|---|---|---|---|---|\n'
-    local count=0 sdir sid status note since task
-    if [ -d "$bridge_dir/sessions" ]; then
-      # Sort by status mtime desc so the most recent activity is on top.
-      while IFS= read -r sdir; do
-        [ -n "$sdir" ] || continue
-        sid="$(basename "$(dirname "$sdir")")"
-        status="$(cat "$sdir" 2>/dev/null || echo idle)"
-        note="$(cat "$(dirname "$sdir")/note" 2>/dev/null || true)"
-        since="$(date -u -r "$sdir" +%FT%TZ 2>/dev/null \
-                 || date -u -d "@$(stat -c %Y "$sdir" 2>/dev/null)" +%FT%TZ 2>/dev/null \
-                 || true)"
-        task="$(lb_task_for_sid "$bridge_dir" "$sid")"
-        # Make the note safe for a markdown table cell.
-        note="${note//|/\\|}"
-        note="${note//$'\n'/ }"
-        printf '| %s | %s | `%s` | %s | %s |\n' \
-          "$status" "${task:--}" "$sid" "${since:--}" "${note:--}"
-        count=$((count+1))
-      done < <(find "$bridge_dir/sessions" -mindepth 2 -maxdepth 2 -name status -type f -printf '%T@ %p\n' 2>/dev/null \
-                | sort -rn \
-                | awk '{ $1=""; sub(/^ /,""); print }')
-    fi
-    if [ "$count" -eq 0 ]; then
-      printf '| _no tasks yet_ | — | — | — | — |\n'
-    fi
+    lb_render_task_rows "$bridge_dir"
   } > "$tmp" 2>/dev/null && mv "$tmp" "$index"
 }
 

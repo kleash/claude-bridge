@@ -203,31 +203,11 @@ handle_task() {
 }
 
 # Build a markdown table of all known sessions, for /list and /status.
+# Header lives here; rows come from the shared lb_render_task_rows.
 render_task_table() {
-  local sdir sid status note since task count=0
   printf '| Status | Task | Session | Last update | Note |\n'
   printf '|---|---|---|---|---|\n'
-  if [ -d "$BRIDGE_DIR/sessions" ]; then
-    while IFS= read -r sdir; do
-      [ -n "$sdir" ] || continue
-      sid="$(basename "$(dirname "$sdir")")"
-      status="$(cat "$sdir" 2>/dev/null || echo idle)"
-      note="$(cat "$(dirname "$sdir")/note" 2>/dev/null || true)"
-      since="$(date -u -r "$sdir" +%FT%TZ 2>/dev/null \
-               || date -u -d "@$(stat -c %Y "$sdir" 2>/dev/null)" +%FT%TZ 2>/dev/null \
-               || true)"
-      task="$(lb_task_for_sid "$BRIDGE_DIR" "$sid")"
-      note="${note//|/\\|}"; note="${note//$'\n'/ }"
-      printf '| %s | %s | `%s` | %s | %s |\n' \
-        "$status" "${task:--}" "$sid" "${since:--}" "${note:--}"
-      count=$((count+1))
-    done < <(find "$BRIDGE_DIR/sessions" -mindepth 2 -maxdepth 2 -name status -type f -printf '%T@ %p\n' 2>/dev/null \
-              | sort -rn \
-              | awk '{ $1=""; sub(/^ /,""); print }')
-  fi
-  if [ "$count" -eq 0 ]; then
-    printf '| _no tasks yet_ | — | — | — | — |\n'
-  fi
+  lb_render_task_rows "$BRIDGE_DIR"
 }
 
 handle_list() {

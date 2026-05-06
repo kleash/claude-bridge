@@ -11,6 +11,7 @@ TESTS=(
   test-pretool-hook.sh
   test-notify-hook.sh
   test-doctor.sh
+  test-index.sh
   test-cli.sh
 )
 
