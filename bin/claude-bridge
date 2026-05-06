@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# claude-bridge: dispatcher CLI. A single entrypoint that wraps the existing
+# scripts (install / uninstall / hook / router / doctor) and adds the
+# day-to-day utilities (status, ls, show, tail, cancel, clean).
+#
+# Usage:
+#   claude-bridge <subcommand> [args]
+#   claude-bridge help
+#
+# License: MIT
+
+set -u
+
+# Be friendly to short-circuiting consumers like `claude-bridge status | grep -q X`:
+# don't die from SIGPIPE on subsequent printf writes once the reader closes.
+trap '' PIPE
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib-bridge.sh
+. "$SELF_DIR/lib-bridge.sh"
+
+VERSION="1.2.0"
+
+# ---- helpers ---------------------------------------------------------------
+
+err()  { printf 'claude-bridge: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+bridge_dir() { lb_resolve_bridge_dir; }
+
+# Where the installer puts the hooks. Self-located if possible.
+install_dir() {
+  if [ -n "${CLAUDE_BRIDGE_INSTALL_DIR:-}" ]; then
+    printf '%s' "$CLAUDE_BRIDGE_INSTALL_DIR"
+  else
+    printf '%s/.claude-bridge' "$HOME"
+  fi
+}
+
+# The router PID file lives inside the bridge dir so it follows BRIDGE_DIR.
+router_pidfile() { printf '%s/.router.pid' "$(bridge_dir)"; }
+
+# ---- subcommand: usage / version ------------------------------------------
+
+cmd_help() {
+  cat <<EOF
+claude-bridge $VERSION — phone <-> Claude Code over a synced folder.
+
+USAGE
+  claude-bridge <subcommand> [args]
+
+SETUP
+  install                    Install hooks and register them with Claude Code.
+  uninstall                  Reverse the install.
+  doctor                     Run setup health checks.
+  enable                     Arm the hook (touch \$BRIDGE/.enabled).
+  disable                    Disarm the hook (remove \$BRIDGE/.enabled).
+
+SESSIONS
+  status                     One-line summary: enabled flag, dir, sync, etc.
+  ls                         Table of all known tasks/sessions.
+  show <task> [--all|--json] Print the latest outbox message (or full log).
+  cancel <task>              Drop a cancel sentinel; any waiting hook releases.
+  tail                       Follow the log + newest outbox files.
+  clean [--days N]           Prune archive (default 14d) + rotate log >10 MB.
+
+ROUTER (optional async daemon for /new + /task directives)
+  router start               Spawn bridge-router.sh in the background.
+  router stop                Terminate the running router.
+  router status              Show whether the router is up.
+
+MISC
+  version                    Print version.
+  help                       This screen.
+
+ENV
+  CLAUDE_BRIDGE_DIR                   override bridge folder
+  CLAUDE_BRIDGE_PERMISSION_TOOLS      CSV of tools to gate via PreToolUse hook
+  CLAUDE_BRIDGE_PERMISSION_TIMEOUT    seconds to wait for phone approval
+  CLAUDE_BRIDGE_TIMEOUT               seconds to wait for phone reply (Stop)
+  CLAUDE_BRIDGE_POLL                  inbox poll interval, seconds
+  CLAUDE_BRIDGE_LOG                   log file path
+
+See 'claude-bridge doctor' for a setup health check.
+EOF
+}
+
+cmd_version() { printf 'claude-bridge %s\n' "$VERSION"; }
+
+# ---- subcommand: install / uninstall --------------------------------------
+
+cmd_install()   { exec "$SELF_DIR/../install.sh"   "$@"; }
+cmd_uninstall() { exec "$SELF_DIR/../uninstall.sh" "$@"; }
+
+# ---- subcommand: enable / disable -----------------------------------------
+
+cmd_enable() {
+  local d; d="$(bridge_dir)"
+  mkdir -p "$d"/{inbox,outbox,archive}
+  touch "$d/.enabled"
+  printf 'enabled — %s/.enabled\n' "$d"
+}
+
+cmd_disable() {
+  local d; d="$(bridge_dir)"
+  rm -f "$d/.enabled"
+  printf 'disabled — removed %s/.enabled\n' "$d"
+}
+
+# ---- subcommand: status / ls / show / tail / cancel / clean ---------------
+
+cmd_status() {
+  local d enabled cloud last
+  d="$(bridge_dir)"
+  if [ -f "$d/.enabled" ]; then enabled="ARMED"; else enabled="dormant"; fi
+  cloud="$(lb_detect_cloud_dir 2>/dev/null || true)"
+  printf 'claude-bridge %s\n'           "$VERSION"
+  printf '  bridge dir : %s\n'           "$d"
+  printf '  enabled    : %s\n'           "$enabled"
+  printf '  cloud sync : %s\n'           "${cloud:-<none detected>}"
+  if [ -d "$d/sessions" ]; then
+    local n; n=$(find "$d/sessions" -mindepth 2 -maxdepth 2 -name status -type f 2>/dev/null | wc -l | tr -d ' ')
+    printf '  sessions   : %s\n' "$n"
+  else
+    printf '  sessions   : 0\n'
+  fi
+  last="$(ls -1t "$d"/outbox/*.md 2>/dev/null | head -n1 || true)"
+  if [ -n "$last" ]; then
+    printf '  latest out : %s\n' "$(basename "$last")"
+  else
+    printf '  latest out : <none>\n'
+  fi
+  printf '  log        : %s\n'           "${CLAUDE_BRIDGE_LOG:-$(lb_default_log_path)}"
+  if [ -f "$(router_pidfile)" ]; then
+    local rpid; rpid="$(cat "$(router_pidfile)" 2>/dev/null || true)"
+    if [ -n "$rpid" ] && kill -0 "$rpid" 2>/dev/null; then
+      printf '  router     : running (pid %s)\n' "$rpid"
+    else
+      printf '  router     : stale pidfile (%s)\n' "$rpid"
+    fi
+  else
+    printf '  router     : not running\n'
+  fi
+}
+
+cmd_ls() {
+  local d; d="$(bridge_dir)"
+  lb_index_rebuild "$d" 2>/dev/null || true
+  if [ -f "$d/outbox/INDEX.md" ]; then
+    cat "$d/outbox/INDEX.md"
+  else
+    printf 'no tasks yet\n'
+  fi
+}
+
+cmd_show() {
+  local mode="latest" task=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)  mode="all";  shift ;;
+      --json) mode="json"; shift ;;
+      -*)     die "unknown flag $1" ;;
+      *)      task="$1"; shift ;;
+    esac
+  done
+  [ -n "$task" ] || die "usage: claude-bridge show <task> [--all|--json]"
+
+  local d sid files
+  d="$(bridge_dir)"
+  sid="$(lb_resolve_task "$d" "$task")"
+  if [ -z "$sid" ]; then
+    die "unknown task: $task"
+  fi
+  files=$(ls -1t "$d"/outbox/${sid}-*.md "$d"/outbox/permission-${sid}-*.md "$d"/outbox/notification-${sid}-*.md 2>/dev/null || true)
+  if [ -z "$files" ]; then
+    die "no outbox files for session $sid"
+  fi
+
+  case "$mode" in
+    latest) head -n 1 <<<"$files" | xargs -I{} cat {} ;;
+    all)    while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              printf '\n=== %s ===\n' "$(basename "$f")"
+              cat "$f"
+            done < <(printf '%s\n' "$files" | tac 2>/dev/null || tail -r <<<"$files") ;;
+    json)   while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              jq -nc --arg n "$(basename "$f")" --rawfile c "$f" '{file:$n, content:$c}'
+            done <<<"$files" ;;
+  esac
+}
+
+cmd_tail() {
+  local d logf; d="$(bridge_dir)"
+  logf="${CLAUDE_BRIDGE_LOG:-$(lb_default_log_path)}"
+  printf 'Following %s and %s/outbox/  (Ctrl-C to stop)\n' "$logf" "$d" >&2
+  mkdir -p "$d/outbox" "$(dirname "$logf")"
+  : >> "$logf"
+  # Stream both with one tail -F so the user sees a unified view.
+  exec tail -F "$logf" "$d"/outbox/*.md 2>/dev/null
+}
+
+cmd_cancel() {
+  local task="${1:-}"
+  [ -n "$task" ] || die "usage: claude-bridge cancel <task>"
+  local d sid; d="$(bridge_dir)"
+  sid="$(lb_cancel_task "$d" "$task" || true)"
+  if [ -z "$sid" ]; then
+    die "unknown task: $task"
+  fi
+  lb_index_rebuild "$d" 2>/dev/null || true
+  printf 'cancel sentinel dropped at %s/sessions/%s/inbox/.cancel\n' "$d" "$sid"
+}
+
+cmd_clean() {
+  local days=14 arg logf
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days)   days="${2:-14}"; shift 2 ;;
+      --days=*) days="${1#--days=}"; shift ;;
+      *)        die "unknown arg $1" ;;
+    esac
+  done
+  local d; d="$(bridge_dir)"
+  logf="${CLAUDE_BRIDGE_LOG:-$(lb_default_log_path)}"
+  lb_clean_archive "$d" "$days"
+  lb_rotate_log    "$logf"
+  printf 'pruned archive entries older than %s days; rotated log if >10 MB\n' "$days"
+}
+
+# ---- subcommand: router ----------------------------------------------------
+
+cmd_router() {
+  local sub="${1:-status}"
+  shift || true
+  local pidf; pidf="$(router_pidfile)"
+  case "$sub" in
+    start)
+      if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+        printf 'router already running (pid %s)\n' "$(cat "$pidf")"; return 0
+      fi
+      local script
+      if   [ -x "$SELF_DIR/bridge-router.sh" ]; then script="$SELF_DIR/bridge-router.sh"
+      elif [ -x "$(install_dir)/bridge-router.sh" ]; then script="$(install_dir)/bridge-router.sh"
+      else die "bridge-router.sh not found"
+      fi
+      mkdir -p "$(dirname "$pidf")"
+      nohup "$script" >/dev/null 2>&1 &
+      echo $! > "$pidf"
+      printf 'router started (pid %s)\n' "$!"
+      ;;
+    stop)
+      if [ ! -f "$pidf" ]; then printf 'router is not running\n'; return 0; fi
+      local pid; pid="$(cat "$pidf")"
+      if kill -0 "$pid" 2>/dev/null; then kill "$pid"; fi
+      rm -f "$pidf"
+      printf 'router stopped\n'
+      ;;
+    status)
+      if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+        printf 'router running (pid %s)\n' "$(cat "$pidf")"
+      else
+        printf 'router not running\n'
+      fi
+      ;;
+    *) die "router subcommand must be: start | stop | status" ;;
+  esac
+}
+
+# ---- subcommand: doctor ----------------------------------------------------
+
+cmd_doctor() {
+  local script
+  if   [ -x "$SELF_DIR/bridge-doctor.sh"        ]; then script="$SELF_DIR/bridge-doctor.sh"
+  elif [ -x "$(install_dir)/bridge-doctor.sh"   ]; then script="$(install_dir)/bridge-doctor.sh"
+  else die "bridge-doctor.sh not found"
+  fi
+  exec "$script" "$@"
+}
+
+# ---- main ------------------------------------------------------------------
+
+if [ $# -lt 1 ]; then
+  cmd_help
+  exit 0
+fi
+
+sub="$1"; shift
+case "$sub" in
+  help|-h|--help)        cmd_help              ;;
+  version|-V|--version)  cmd_version           ;;
+  install)               cmd_install   "$@"    ;;
+  uninstall)             cmd_uninstall "$@"    ;;
+  enable)                cmd_enable    "$@"    ;;
+  disable)               cmd_disable   "$@"    ;;
+  status)                cmd_status    "$@"    ;;
+  ls|list)               cmd_ls        "$@"    ;;
+  show)                  cmd_show      "$@"    ;;
+  tail)                  cmd_tail      "$@"    ;;
+  cancel)                cmd_cancel    "$@"    ;;
+  clean)                 cmd_clean     "$@"    ;;
+  router)                cmd_router    "$@"    ;;
+  doctor)                cmd_doctor    "$@"    ;;
+  *) err "unknown subcommand: $sub"; cmd_help; exit 2 ;;
+esac

@@ -8,7 +8,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ROUTER="$ROOT/bin/bridge-router.sh"
 
 TMP="$(mktemp -d -t claude-bridge-router-test.XXXXXX)"
-trap 'rm -rf "$TMP"; [ -n "${ROUTER_PID:-}" ] && kill "$ROUTER_PID" 2>/dev/null || true' EXIT
+cleanup() {
+  if [ -n "${ROUTER_PID:-}" ]; then
+    kill "$ROUTER_PID" 2>/dev/null || true
+    wait "$ROUTER_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 BRIDGE="$TMP/bridge"
 mkdir -p "$BRIDGE/inbox"

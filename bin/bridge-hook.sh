@@ -57,6 +57,9 @@ mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG"; }
 
+# shellcheck source=lib-bridge.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-bridge.sh"
+
 # ---- read hook input --------------------------------------------------------
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -152,6 +155,11 @@ TMP="$OUT_FILE.tmp"
 mv "$TMP" "$OUT_FILE"
 log "session=$SESSION_ID wrote $OUT_FILE"
 
+# ---- mark session waiting + refresh INDEX.md -------------------------------
+
+lb_set_status "$BRIDGE_DIR" "$SESSION_ID" "waiting" "Stop hook"
+lb_index_rebuild "$BRIDGE_DIR" 2>/dev/null || true
+
 # ---- poll inbox for reply ---------------------------------------------------
 
 START_EPOCH="$(date +%s)"
@@ -160,7 +168,16 @@ POLL="${CLAUDE_BRIDGE_POLL:-2}"
 log "session=$SESSION_ID polling session=$INBOX_SESSION top=$INBOX_TOP timeout=${TIMEOUT}s"
 
 REPLY_FILE=""
+CANCELLED=0
 while :; do
+  # Cancel sentinel (dropped by `claude-bridge cancel <task>` or `/cancel`).
+  # Honors the same exit-fast pattern as `stop_hook_active`.
+  if [ -e "$INBOX_SESSION/.cancel" ]; then
+    log "session=$SESSION_ID cancel sentinel found; releasing"
+    rm -f "$INBOX_SESSION/.cancel"
+    CANCELLED=1
+    break
+  fi
   # Per-session subfolder wins unconditionally — that is the whole point of
   # routing by session id. Top-level inbox is the fallback for single-session
   # / unrouted use.
@@ -175,15 +192,26 @@ while :; do
   NOW="$(date +%s)"
   if [ $((NOW - START_EPOCH)) -ge "$TIMEOUT" ]; then
     log "session=$SESSION_ID timeout reached, releasing"
+    lb_set_status "$BRIDGE_DIR" "$SESSION_ID" "idle" "timed out"
+    lb_index_rebuild "$BRIDGE_DIR" 2>/dev/null || true
     exit 0
   fi
   sleep "$POLL"
 done
 
+if [ "$CANCELLED" -eq 1 ]; then
+  lb_set_status "$BRIDGE_DIR" "$SESSION_ID" "idle" "cancelled"
+  lb_index_rebuild "$BRIDGE_DIR" 2>/dev/null || true
+  exit 0
+fi
+
 REPLY_TEXT="$(cat "$REPLY_FILE")"
 ARCHIVED="$ARCHIVE/${SESSION_ID}-${TS}-$(basename "$REPLY_FILE")"
 mv "$REPLY_FILE" "$ARCHIVED" 2>/dev/null || true
 log "session=$SESSION_ID consumed $REPLY_FILE -> $ARCHIVED"
+
+lb_set_status "$BRIDGE_DIR" "$SESSION_ID" "idle"
+lb_index_rebuild "$BRIDGE_DIR" 2>/dev/null || true
 
 # Emit the JSON decision: tell Claude to continue with the reply as next turn.
 jq -nc --arg r "$REPLY_TEXT" '{decision:"block", reason:$r}'

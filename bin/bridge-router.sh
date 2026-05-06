@@ -51,6 +51,9 @@ LOG="${CLAUDE_BRIDGE_LOG:-$(default_log_path)}"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 log() { printf '[%s] router: %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG"; }
 
+# shellcheck source=lib-bridge.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-bridge.sh"
+
 if ! command -v jq >/dev/null 2>&1; then
   printf 'router: jq is required\n' >&2
   exit 1
@@ -168,7 +171,9 @@ handle_new() {
   fi
   printf '%s' "$sid" > "$TASKS/$safe"
   mkdir -p "$SESSIONS/$sid/inbox"
+  lb_set_status "$BRIDGE_DIR" "$sid" "idle" "$safe"
   write_outbox "$sid" "$safe" "$result"
+  lb_index_rebuild "$BRIDGE_DIR" 2>/dev/null || true
 }
 
 handle_task() {
@@ -193,6 +198,116 @@ handle_task() {
     printf '%s' "$new_sid" > "$TASKS/$safe"
   fi
   write_outbox "${new_sid:-$sid}" "$safe" "$result"
+  lb_set_status "$BRIDGE_DIR" "${new_sid:-$sid}" "idle" "$safe"
+  lb_index_rebuild "$BRIDGE_DIR" 2>/dev/null || true
+}
+
+# Build a markdown table of all known sessions, for /list and /status.
+render_task_table() {
+  local sdir sid status note since task count=0
+  printf '| Status | Task | Session | Last update | Note |\n'
+  printf '|---|---|---|---|---|\n'
+  if [ -d "$BRIDGE_DIR/sessions" ]; then
+    while IFS= read -r sdir; do
+      [ -n "$sdir" ] || continue
+      sid="$(basename "$(dirname "$sdir")")"
+      status="$(cat "$sdir" 2>/dev/null || echo idle)"
+      note="$(cat "$(dirname "$sdir")/note" 2>/dev/null || true)"
+      since="$(date -u -r "$sdir" +%FT%TZ 2>/dev/null \
+               || date -u -d "@$(stat -c %Y "$sdir" 2>/dev/null)" +%FT%TZ 2>/dev/null \
+               || true)"
+      task="$(lb_task_for_sid "$BRIDGE_DIR" "$sid")"
+      note="${note//|/\\|}"; note="${note//$'\n'/ }"
+      printf '| %s | %s | `%s` | %s | %s |\n' \
+        "$status" "${task:--}" "$sid" "${since:--}" "${note:--}"
+      count=$((count+1))
+    done < <(find "$BRIDGE_DIR/sessions" -mindepth 2 -maxdepth 2 -name status -type f -printf '%T@ %p\n' 2>/dev/null \
+              | sort -rn \
+              | awk '{ $1=""; sub(/^ /,""); print }')
+  fi
+  if [ "$count" -eq 0 ]; then
+    printf '| _no tasks yet_ | — | — | — | — |\n'
+  fi
+}
+
+handle_list() {
+  log "/list"
+  local body
+  body="$(printf '## All tasks\n\n%s\n' "$(render_task_table)")"
+  write_outbox "" "list" "$body"
+}
+
+handle_status() {
+  local id="${1:-}" sid task body
+  if [ -z "$id" ]; then
+    log "/status (all)"
+    body="$(printf '## Status\n\n%s\n' "$(render_task_table)")"
+    write_outbox "" "status" "$body"
+    return
+  fi
+  log "/status $id"
+  sid="$(lb_resolve_task "$BRIDGE_DIR" "$id")"
+  if [ -z "$sid" ]; then
+    write_outbox "" "status" "unknown task id: $id"
+    return
+  fi
+  task="$(lb_task_for_sid "$BRIDGE_DIR" "$sid")"
+  body="$(printf '## Status — %s\n\n- session: `%s`\n- status: `%s`\n- note: %s\n' \
+    "${task:-$id}" "$sid" \
+    "$(lb_get_status "$BRIDGE_DIR" "$sid")" \
+    "$(cat "$BRIDGE_DIR/sessions/$sid/note" 2>/dev/null || echo '—')")"
+  write_outbox "$sid" "${task:-$id}" "$body"
+}
+
+handle_cancel() {
+  local id="${1:-}" sid task
+  if [ -z "$id" ]; then
+    write_outbox "" "router" "/cancel needs a task id or session id"
+    return
+  fi
+  log "/cancel $id"
+  sid="$(lb_cancel_task "$BRIDGE_DIR" "$id" || true)"
+  if [ -z "$sid" ]; then
+    write_outbox "" "router" "unknown task id: $id"
+    return
+  fi
+  task="$(lb_task_for_sid "$BRIDGE_DIR" "$sid")"
+  write_outbox "$sid" "${task:-$id}" \
+    "Cancel sentinel dropped for \`${task:-$sid}\`. The waiting hook will release within one poll cycle."
+  lb_index_rebuild "$BRIDGE_DIR" 2>/dev/null || true
+}
+
+handle_help() {
+  log "/help"
+  local body
+  body=$'## claude-bridge directives\n\n'
+  body+=$'| First line of inbox file | Effect |\n'
+  body+=$'|---|---|\n'
+  body+=$'| `/new <title>` | Spawn a new headless `claude -p` session; rest of file is the prompt. |\n'
+  body+=$'| `/task <id>` | Resume the recorded session via `claude --resume`; rest of file is the prompt. |\n'
+  body+=$'| `/list` | Write a table of all known tasks to outbox. |\n'
+  body+=$'| `/status [task]` | Status of one task, or all if omitted. |\n'
+  body+=$'| `/cancel <task>` | Drop a `.cancel` sentinel; any waiting hook for that task releases. |\n'
+  body+=$'| `/clean [--days N]` | Delete archive entries older than N days (default 14). |\n'
+  body+=$'| `/help` | Print this cheatsheet. |\n'
+  body+=$'\nReplies to a Stop or PreToolUse hook are *bare* files (no directive) — those are routed to the per-session inbox and consumed by the waiting hook.\n'
+  write_outbox "" "help" "$body"
+}
+
+handle_clean() {
+  local days=14 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --days=*) days="${arg#--days=}" ;;
+      --days)   : ;; # next loop iter handles value below
+      *) [[ "$arg" =~ ^[0-9]+$ ]] && days="$arg" ;;
+    esac
+  done
+  log "/clean days=$days"
+  lb_clean_archive "$BRIDGE_DIR" "$days"
+  lb_rotate_log    "$LOG"
+  write_outbox "" "clean" \
+    "Pruned archive entries older than ${days} days; rotated log if needed."
 }
 
 # parse one inbox file (already established to exist)
@@ -202,19 +317,34 @@ process_file() {
   body="$(tail -n +2 "$f" 2>/dev/null || true)"
   # Strip trailing CR (Windows-edited files via OneDrive) for safety.
   first="${first%$'\r'}"
-  case "$first" in
-    /new\ *)   handle_new "${first#/new }" "$body" ;;
-    /new)      handle_new "untitled" "$body" ;;
-    /task\ *)  handle_task "${first#/task }" "$body" ;;
-    /task)     log "malformed /task line in $f"
-               write_outbox "" "router" "/task without an id in $(basename "$f")" ;;
-    *)         log "no directive in $(basename "$f"); leaving for hook"
-               # Don't archive — let any active Stop hook on top-level inbox
-               # consume it as before.
-               return 1 ;;
-  esac
+  parse_directive "$first" "$body" || return 1
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   mv "$f" "$ARCHIVE/router-$ts-$(basename "$f")" 2>/dev/null || true
+}
+
+# Centralized directive switch. Args: first_line, body. Returns non-zero if
+# the file is bare (no directive) so the caller leaves it for the Stop hook.
+parse_directive() {
+  local first="$1" body="$2"
+  case "$first" in
+    /new\ *)     handle_new "${first#/new }" "$body" ;;
+    /new)        handle_new "untitled" "$body" ;;
+    /task\ *)    handle_task "${first#/task }" "$body" ;;
+    /task)       log "malformed /task"
+                 write_outbox "" "router" "/task without an id" ;;
+    /list|/list\ *)         handle_list ;;
+    /status)                handle_status "" ;;
+    /status\ *)             handle_status "${first#/status }" ;;
+    /cancel)                handle_cancel "" ;;
+    /cancel\ *)             handle_cancel "${first#/cancel }" ;;
+    /help|/help\ *)         handle_help ;;
+    /clean)                 handle_clean ;;
+    /clean\ *)              # shellcheck disable=SC2086
+                            handle_clean ${first#/clean } ;;
+    *)           # No directive — leave it for the Stop hook on top-level inbox.
+                 log "no directive in inbox file; leaving for hook"
+                 return 1 ;;
+  esac
 }
 
 # ---- main loop --------------------------------------------------------------
