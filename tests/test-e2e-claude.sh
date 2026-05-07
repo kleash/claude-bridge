@@ -87,12 +87,19 @@ run_case() {
 
   start_watchdog "$reply_body"
 
-  # Launch claude.
+  # Launch claude from an EMPTY working directory so it can't auto-discover
+  # this repo's CLAUDE.md / git history and hijack the prompt with project
+  # context. (We saw exactly that on a first attempt: Claude tried to commit
+  # files instead of running the requested echo.)
+  local cleanwd="$WORKDIR/runwd-$name"
+  mkdir -p "$cleanwd"
   (
+    cd "$cleanwd" && \
     claude -p \
       --settings "$SETTINGS_JSON" \
       --permission-mode default \
       --output-format json \
+      --append-system-prompt "You are in a sandboxed test. Do exactly what the user asks; do not invent additional tasks or context. There is no git repo here." \
       "$prompt" \
       > "$result_file" 2> "$err_file"
   ) &
