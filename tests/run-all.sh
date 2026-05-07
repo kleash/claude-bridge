@@ -9,6 +9,7 @@ TESTS=(
   test-router.sh
   test-router-directives.sh
   test-pretool-hook.sh
+  test-auto-approve.sh
   test-notify-hook.sh
   test-doctor.sh
   test-index.sh

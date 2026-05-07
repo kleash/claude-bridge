@@ -61,6 +61,7 @@ SESSIONS
   ls                         Table of all known tasks/sessions.
   show <task> [--all|--json] Print the latest outbox message (or full log).
   cancel <task>              Drop a cancel sentinel; any waiting hook releases.
+  revoke <task> [--tool T]   Clear auto-approve state (per tool, or all).
   tail                       Follow the log + newest outbox files.
   clean [--days N]           Prune archive (default 14d) + rotate log >10 MB.
 
@@ -212,6 +213,29 @@ cmd_cancel() {
   printf 'cancel sentinel dropped at %s/sessions/%s/inbox/.cancel\n' "$d" "$sid"
 }
 
+cmd_revoke() {
+  local task="" tool=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tool)   tool="${2:-}"; shift 2 ;;
+      --tool=*) tool="${1#--tool=}"; shift ;;
+      -*)       die "unknown flag $1" ;;
+      *)        task="$1"; shift ;;
+    esac
+  done
+  [ -n "$task" ] || die "usage: claude-bridge revoke <task> [--tool TOOL]"
+  local d sid; d="$(bridge_dir)"
+  sid="$(lb_resolve_task "$d" "$task")"
+  [ -n "$sid" ] || die "unknown task: $task"
+  lb_clear_auto_approve "$d" "$sid" "$tool"
+  lb_index_rebuild "$d" 2>/dev/null || true
+  if [ -n "$tool" ]; then
+    printf 'revoked auto-approve for session %s (tool: %s)\n' "$sid" "$tool"
+  else
+    printf 'revoked all auto-approve state for session %s\n' "$sid"
+  fi
+}
+
 cmd_clean() {
   local days=14 arg logf
   while [ $# -gt 0 ]; do
@@ -298,6 +322,7 @@ case "$sub" in
   show)                  cmd_show      "$@"    ;;
   tail)                  cmd_tail      "$@"    ;;
   cancel)                cmd_cancel    "$@"    ;;
+  revoke)                cmd_revoke    "$@"    ;;
   clean)                 cmd_clean     "$@"    ;;
   router)                cmd_router    "$@"    ;;
   doctor)                cmd_doctor    "$@"    ;;

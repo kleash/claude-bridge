@@ -178,7 +178,42 @@ lb_parse_permission_reply() {
   local first lower
   first="$(printf '%s' "$body" | awk 'NF{sub(/^[ \t]+/,""); sub(/[ \t]+$/,""); print; exit}')"
   lower="$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')"
+
+  # Default: no persistent state change.
+  REPLY_PERSIST="${REPLY_PERSIST:-}"
+  REPLY_PERSIST=""
+
   case "$lower" in
+    # --- session-persistent approve ---------------------------------------
+    "approve always"|"approve session"|"approve all"|"always approve"|"approve forever")
+      REPLY_DECISION="approve"
+      REPLY_REASON="approved by phone (session: always)"
+      REPLY_PERSIST="always"
+      return ;;
+    # --- counted approve: "approve N" -------------------------------------
+    "approve "*)
+      local rest n
+      rest="${lower#approve }"
+      # Strip trailing "more" / "calls" / "times" if user typed any.
+      rest="${rest% more}"; rest="${rest% calls}"; rest="${rest% times}"
+      rest="${rest# }"; rest="${rest% }"
+      if [[ "$rest" =~ ^[0-9]+$ ]]; then
+        n="$rest"
+        if [ "$n" -ge 1 ] && [ "$n" -le 9999 ]; then
+          REPLY_DECISION="approve"
+          REPLY_REASON="approved by phone (count: $n)"
+          REPLY_PERSIST="count:$n"
+          return
+        fi
+      fi
+      ;;
+    # --- revoke: clear session approve state, then block this call --------
+    revoke|"revoke approve"|"revoke all"|"revoke always"|"revoke session")
+      REPLY_DECISION="block"
+      REPLY_REASON="auto-approve revoked by phone; please re-approve"
+      REPLY_PERSIST="revoke"
+      return ;;
+    # --- one-shot approve / deny (existing) -------------------------------
     approve|approved|yes|y|ok|allow|approve.)
       REPLY_DECISION="approve"
       REPLY_REASON="approved by phone"
@@ -253,4 +288,163 @@ lb_rotate_log() {
   done
   mv "$logf" "$logf.1"
   : > "$logf"
+}
+
+# ---- per-session auto-approve state ---------------------------------------
+# Goal: a phone user can reply "approve always" or "approve N" once and stop
+# being pinged for every Bash sub-call in a multi-call turn. State files live
+# in sessions/<sid>/ and are per-tool, so approving Bash doesn't auto-approve
+# Edit. A TTL (default 30 min, env: CLAUDE_BRIDGE_AUTO_APPROVE_TTL) prevents a
+# forgotten flag from approving destructive commands hours later.
+
+# Path of the always-approve flag for a given (session, tool).
+lb_auto_approve_flag() {
+  local bridge_dir="$1" sid="$2" tool="$3"
+  printf '%s/sessions/%s/auto-approve-%s' "$bridge_dir" "$sid" "$tool"
+}
+
+# Path of the counted-approve file for a given (session, tool).
+lb_auto_approve_count_file() {
+  local bridge_dir="$1" sid="$2" tool="$3"
+  printf '%s/sessions/%s/auto-approve-count-%s' "$bridge_dir" "$sid" "$tool"
+}
+
+# Set the always-approve flag (touch the file; mtime is the TTL anchor).
+lb_set_auto_approve_always() {
+  local bridge_dir="$1" sid="$2" tool="$3" f
+  f="$(lb_auto_approve_flag "$bridge_dir" "$sid" "$tool")"
+  mkdir -p "$(dirname "$f")"
+  : > "$f"
+}
+
+# Set the counted-approve remaining count.
+lb_set_auto_approve_count() {
+  local bridge_dir="$1" sid="$2" tool="$3" n="$4" f
+  f="$(lb_auto_approve_count_file "$bridge_dir" "$sid" "$tool")"
+  mkdir -p "$(dirname "$f")"
+  printf '%s\n' "$n" > "$f.tmp.$$" && mv "$f.tmp.$$" "$f"
+}
+
+# Clear all auto-approve state for a (session, tool).
+# If tool is empty, clear for ALL tools in this session.
+lb_clear_auto_approve() {
+  local bridge_dir="$1" sid="$2" tool="${3:-}"
+  local sdir="$bridge_dir/sessions/$sid"
+  [ -d "$sdir" ] || return 0
+  if [ -n "$tool" ]; then
+    rm -f "$sdir/auto-approve-$tool" "$sdir/auto-approve-count-$tool"
+  else
+    rm -f "$sdir"/auto-approve-* "$sdir"/auto-approve-count-*
+  fi
+}
+
+# Decide whether the current PreToolUse call should auto-approve, based on
+# (a) static CLAUDE_BRIDGE_AUTO_APPROVE_BASH_PATTERNS,
+# (b) per-session always flag (with TTL),
+# (c) per-session counted-approve (decrements on use).
+#
+# Sets globals on hit:
+#   AUTO_APPROVE_HIT="static" | "always" | "count" | ""
+#   AUTO_APPROVE_REASON=<human-readable note>
+#
+# Args: bridge_dir sid tool tool_input_summary
+# tool_input_summary is the most relevant single-line representation of the
+# tool input (Bash command, file path, …). Static patterns match against it
+# only when tool=Bash (the realistic noisy case).
+lb_check_auto_approve() {
+  local bridge_dir="$1" sid="$2" tool="$3" summary="$4"
+  AUTO_APPROVE_HIT=""
+  AUTO_APPROVE_REASON=""
+
+  # (a) static Bash pattern allowlist
+  if [ "$tool" = "Bash" ] && [ -n "${CLAUDE_BRIDGE_AUTO_APPROVE_BASH_PATTERNS:-}" ]; then
+    local pat saved_ifs
+    saved_ifs="$IFS"; IFS=','
+    for pat in $CLAUDE_BRIDGE_AUTO_APPROVE_BASH_PATTERNS; do
+      pat="${pat# }"; pat="${pat% }"
+      [ -n "$pat" ] || continue
+      # Bash glob match.
+      # shellcheck disable=SC2254
+      case "$summary" in
+        $pat)
+          IFS="$saved_ifs"
+          AUTO_APPROVE_HIT="static"
+          AUTO_APPROVE_REASON="static pattern '$pat' matched"
+          return 0 ;;
+      esac
+    done
+    IFS="$saved_ifs"
+  fi
+
+  # (b) per-session always flag, with TTL
+  local flag ttl now mtime age
+  flag="$(lb_auto_approve_flag "$bridge_dir" "$sid" "$tool")"
+  if [ -e "$flag" ]; then
+    ttl="${CLAUDE_BRIDGE_AUTO_APPROVE_TTL:-1800}"
+    now="$(date +%s)"
+    mtime="$(date -u -r "$flag" +%s 2>/dev/null \
+             || stat -c %Y "$flag" 2>/dev/null \
+             || echo "$now")"
+    age=$((now - mtime))
+    if [ "$age" -le "$ttl" ]; then
+      AUTO_APPROVE_HIT="always"
+      AUTO_APPROVE_REASON="session always-approve flag set (age ${age}s, ttl ${ttl}s)"
+      return 0
+    fi
+    # Expired: garbage-collect.
+    rm -f "$flag"
+  fi
+
+  # (c) per-session counted approve
+  local cfile n
+  cfile="$(lb_auto_approve_count_file "$bridge_dir" "$sid" "$tool")"
+  if [ -f "$cfile" ]; then
+    n="$(cat "$cfile" 2>/dev/null | tr -dc '0-9' || echo 0)"
+    if [ "${n:-0}" -gt 0 ]; then
+      local new=$((n - 1))
+      if [ "$new" -le 0 ]; then
+        rm -f "$cfile"
+      else
+        printf '%s\n' "$new" > "$cfile.tmp.$$" && mv "$cfile.tmp.$$" "$cfile"
+      fi
+      AUTO_APPROVE_HIT="count"
+      AUTO_APPROVE_REASON="counted-approve (was $n, now $new)"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# Compose a human-readable summary of any active auto-approve state for a
+# session, used as the INDEX note. Empty if nothing is active.
+# Args: bridge_dir sid
+lb_auto_approve_summary() {
+  local bridge_dir="$1"
+  local sid="$2"
+  local sdir="$bridge_dir/sessions/$sid"
+  [ -d "$sdir" ] || return 0
+  local out="" f tool ttl now mtime age
+  ttl="${CLAUDE_BRIDGE_AUTO_APPROVE_TTL:-1800}"
+  now="$(date +%s)"
+  for f in "$sdir"/auto-approve-*; do
+    [ -e "$f" ] || continue
+    case "$(basename "$f")" in
+      auto-approve-count-*)
+        tool="${f##*auto-approve-count-}"
+        local n; n="$(cat "$f" 2>/dev/null | tr -dc '0-9' || echo 0)"
+        [ "${n:-0}" -gt 0 ] && out+="${out:+, }${tool}:count=${n}"
+        ;;
+      auto-approve-*)
+        tool="${f##*auto-approve-}"
+        mtime="$(date -u -r "$f" +%s 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "$now")"
+        age=$((now - mtime))
+        if [ "$age" -le "$ttl" ]; then
+          local rem=$((ttl - age))
+          out+="${out:+, }${tool}:always (${rem}s left)"
+        fi
+        ;;
+    esac
+  done
+  [ -n "$out" ] && printf 'auto-approve(%s)' "$out"
 }

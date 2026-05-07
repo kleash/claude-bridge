@@ -61,8 +61,13 @@ OUT="$(make_input Bash "rm -rf build/" | \
   bash "$HOOK")"
 DEC="$(printf '%s' "$OUT" | jq -r '.decision')"
 [ "$DEC" = "approve" ] || { echo "FAIL: expected approve, got: $OUT"; exit 1; }
-ls "$BRIDGE/outbox"/permission-${SID}-*.md >/dev/null \
-  || { echo "FAIL: no permission outbox file written"; exit 1; }
+# The hook archives the permission file once a reply comes in (so the phone
+# doesn't keep seeing a "tap me!" prompt for a call that's already been
+# resolved). So accept the file in EITHER outbox/ (in-flight) or
+# archive/answered-* (after-reply).
+{ ls "$BRIDGE/outbox"/permission-${SID}-*.md 2>/dev/null \
+  || ls "$BRIDGE/archive"/answered-permission-${SID}-*.md 2>/dev/null; } >/dev/null \
+  || { echo "FAIL: no permission file written or archived"; ls -laR "$BRIDGE"; exit 1; }
 [ -f "$BRIDGE/sessions/$SID/status" ] || { echo "FAIL: status file missing"; exit 1; }
 [ -f "$BRIDGE/outbox/INDEX.md" ]      || { echo "FAIL: INDEX.md not generated"; exit 1; }
 echo "case 3 PASS: 'approve' -> {decision:approve}, outbox + INDEX written"

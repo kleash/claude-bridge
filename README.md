@@ -364,11 +364,62 @@ one of those bodies. The hook decides:
 
 Configuration:
 
-| Variable                          | Default | Purpose                                       |
-| --------------------------------- | ------- | --------------------------------------------- |
-| `CLAUDE_BRIDGE_PERMISSION_TOOLS`  | _empty_ | CSV of tool names to gate (off by default).   |
-| `CLAUDE_BRIDGE_PERMISSION_TIMEOUT`| `1800`  | Seconds to wait before auto-blocking.         |
-| `CLAUDE_BRIDGE_PERMISSION_DEFAULT`| `block` | `block` (recommended) or `passthrough`.       |
+| Variable                                  | Default | Purpose                                       |
+| ----------------------------------------- | ------- | --------------------------------------------- |
+| `CLAUDE_BRIDGE_PERMISSION_TOOLS`          | _empty_ | CSV of tool names to gate (off by default).   |
+| `CLAUDE_BRIDGE_PERMISSION_TIMEOUT`        | `1800`  | Seconds to wait before auto-blocking.         |
+| `CLAUDE_BRIDGE_PERMISSION_DEFAULT`        | `block` | `block` (recommended) or `passthrough`.       |
+| `CLAUDE_BRIDGE_AUTO_APPROVE_BASH_PATTERNS`| _empty_ | CSV of bash globs that auto-approve **without** ever pinging the phone. e.g. `"git status*,git diff*,git log*,ls*,pwd,cat *"`. |
+| `CLAUDE_BRIDGE_AUTO_APPROVE_TTL`          | `1800`  | Seconds an `approve always` flag stays valid before re-prompting. |
+
+### One tap covers a whole turn (`approve always`)
+
+Claude often makes **multiple Bash sub-calls per turn** — a `git status` to
+gather context, then the command you actually asked for, then maybe a
+verification step. With OneDrive sync latency, replying `approve` 3-5 times
+per turn is miserable. v1.3 fixes this in three independent ways:
+
+1. **Static allowlist** — set `CLAUDE_BRIDGE_AUTO_APPROVE_BASH_PATTERNS` once
+   in your shell rc and the listed commands **never round-trip through the
+   cloud folder at all**. The hook short-circuits in-process. Use this for
+   read-only commands that you're always going to approve anyway:
+   ```sh
+   export CLAUDE_BRIDGE_AUTO_APPROVE_BASH_PATTERNS="git status*,git diff*,git log*,ls*,pwd,cat *,which *"
+   ```
+
+2. **Session-persistent `approve always`** — reply `approve always` (or
+   `approve session`) to a permission request and **all subsequent calls for
+   that tool in that session** auto-approve silently. State lives in
+   `sessions/<sid>/auto-approve-<Tool>` with a TTL (default 30 min) so a
+   forgotten flag can't auto-approve `rm -rf` four hours later. Per-tool, so
+   approving Bash doesn't auto-approve Edit.
+
+3. **Counted `approve N`** — reply `approve 5` to auto-approve the next 5
+   calls for that tool, then prompt again. Lower commitment than `always`.
+
+The phone reply tokens, in full:
+
+| Reply                       | Effect                                                 |
+| --------------------------- | ------------------------------------------------------ |
+| `approve`                   | this one call only.                                    |
+| `approve always`            | this call + all subsequent ones for this tool/session. |
+| `approve N`                 | this call + the next N for this tool/session.          |
+| `deny` / `deny: <reason>`   | block this call (one-shot).                            |
+| `revoke`                    | clear all auto-approve state for this tool **and** block the current call. |
+| _(any other text)_          | block; Claude reads your text as the reason.           |
+
+Revoke from the laptop too: `claude-bridge revoke <task> [--tool TOOL]`.
+
+The currently-active autopilot is shown in the `Note` column of `INDEX.md`,
+e.g. `auto-approve(Bash:always (1432s left))`, so the phone user always
+knows what's on autopilot.
+
+**Race-safe under parallel Bash.** Claude often fires multiple `Bash` calls
+in one turn (concurrent context-gathering plus the actual command). When you
+reply `approve always` to one of them, the **other in-flight hooks notice
+the new flag during their poll loop and short-circuit immediately**, moving
+their now-stale permission files to `archive/raced-*.md` so the phone
+doesn't see ghost prompts. A single tap really is a single tap.
 
 > ⚠️ **Router-spawned `/new` and `/task` sessions skip this gate by default.**
 > The router invokes `claude -p` with `--dangerously-skip-permissions`
